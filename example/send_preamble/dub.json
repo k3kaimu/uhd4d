@@ -1,0 +1,16 @@
+{
+	"name": "send_preamble",
+	"authors": [
+		"Komatsu Kazuki"
+	],
+	"description": "A minimal D application.",
+	"copyright": "Copyright © 2016, Komatsu Kazuki",
+	"license": "proprietary",
+    "sourceFiles": ["drs.o"],
+
+    "dependencies": {
+        "carbon": {"path": "../../../carbon"},
+        "uhd": {"path": "../../../uhd"},
+        "fdphy": {"path": "../../../fdphy"}
+    }
+}

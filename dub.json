@@ -1,0 +1,10 @@
+{
+	"name": "uhd",
+	"authors": [
+		"Komatsu Kazuki"
+	],
+	"description": "UHD wrapper",
+	"copyright": "Copyright © 2016, Komatsu Kazuki",
+	"license": "NYSL",
+    "libs": ["uhd"]
+}

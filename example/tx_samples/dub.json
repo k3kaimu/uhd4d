@@ -1,0 +1,13 @@
+{
+    "name": "tx_samples",
+    "authors": [
+        "Komatsu Kazuki"
+    ],
+    "description": "A minimal D application.",
+    "copyright": "Copyright © 2016, Komatsu Kazuki",
+    "license": "proprietary",
+
+    "dependencies":{
+        "uhd": { "path": "../../" }
+    }
+}
