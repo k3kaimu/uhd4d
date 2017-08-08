@@ -212,13 +212,29 @@ struct StreamArgs
 struct StreamCommand
 {
     static
-    StreamCommand continuousNow()
+    StreamCommand startContinuous()
     {
         StreamCommand cmd;
         with(cmd._value){
             stream_mode = uhd_stream_mode_t.START_CONTINUOUS;
             num_samps = 0;
             stream_now = true;
+            time_spec_full_secs = 0;
+            time_spec_frac_secs = 0;
+        }
+
+        return cmd;
+    }
+
+
+    static
+    StreamCommand stopContinuous()
+    {
+        StreamCommand cmd;
+        with(cmd._value){
+            stream_mode = uhd_stream_mode_t.STOP_CONTINUOUS;
+            num_samps = 0;
+            stream_now = false;
             time_spec_full_secs = 0;
             time_spec_frac_secs = 0;
         }
@@ -258,7 +274,7 @@ struct RxStreamer
     }
 
 
-    size_t recv(T)(T[] buffer, RxMetaData md, double timeout)
+    size_t recv(T)(T[] buffer, ref RxMetaData md, double timeout)
     {
         size_t res;
         void* p = cast(void*)buffer.ptr;
