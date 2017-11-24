@@ -2,6 +2,8 @@ module uhd.capi.error;
 
 
 extern(C):
+@nogc:
+nothrow:
 
 enum uhd_error
 {

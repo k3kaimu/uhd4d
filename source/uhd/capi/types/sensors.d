@@ -3,10 +3,13 @@ module uhd.capi.types.sensors;
 import uhd.capi.config;
 import uhd.capi.error;
 
-struct uhd_sensor_value_t;
-
 
 extern(C):
+nothrow:
+@nogc:
+
+
+struct uhd_sensor_value_t;
 
 alias uhd_sensor_value_handle = uhd_sensor_value_t*;
 

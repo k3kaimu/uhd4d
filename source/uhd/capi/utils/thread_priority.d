@@ -4,6 +4,11 @@ import uhd.capi.config;
 import uhd.capi.error;
 
 
+extern(C):
+nothrow:
+@nogc:
+
+
 enum float uhd_default_thread_priority = 0.5;
 
 

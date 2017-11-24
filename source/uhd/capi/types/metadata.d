@@ -11,6 +11,9 @@ struct uhd_tx_metadata_t;
 struct uhd_async_metadata_t;
 
 extern(C):
+nothrow:
+@nogc:
+
 
 alias uhd_rx_metadata_handle = uhd_rx_metadata_t*;
 alias uhd_tx_metadata_handle = uhd_tx_metadata_t*;

@@ -4,6 +4,9 @@ import uhd.capi.config;
 
 
 extern(C):
+nothrow:
+@nogc:
+
 
 enum uhd_tune_request_policy_t
 {

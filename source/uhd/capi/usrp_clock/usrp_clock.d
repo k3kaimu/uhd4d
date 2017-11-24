@@ -7,6 +7,8 @@ import uhd.capi.types.string_vector;
 
 
 extern(C):
+nothrow:
+@nogc:
 
 struct uhd_usrp_clock;
 

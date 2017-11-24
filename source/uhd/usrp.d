@@ -6,6 +6,7 @@ import std.datetime;
 import uhd.utils;
 import uhd.capi;
 import std.typecons;
+import std.traits;
 
 
 struct TxMetaData
@@ -28,18 +29,18 @@ struct TxMetaData
     }
 
 
-    this(SysTime time, bool startOfBurst, bool endOfBurst)
+    this(Duration time, bool startOfBurst, bool endOfBurst)
     {
-        auto uxtime = time.splitToUnixTime();
+        auto uhdTime = time.splitToFullAndFracSecs();
 
-        this(true, uxtime[0], uxtime[1], startOfBurst, endOfBurst);
+        this(true, uhdTime[0], uhdTime[1], startOfBurst, endOfBurst);
     }
 
 
     this(bool hasTimeSpec, time_t fullSecs, double fracSecs, bool startOfBurst, bool endOfBurst)
     {
         _hasTimeSpec = hasTimeSpec;
-        _time = toSysTime(fullSecs, fracSecs);
+        _time = toDuration(fullSecs, fracSecs);
         _startOfBurst = startOfBurst;
         _endOfBurst = endOfBurst;
 
@@ -66,7 +67,7 @@ struct TxMetaData
   private:
     uhd_tx_metadata_handle _handle;
     bool _hasTimeSpec;
-    SysTime _time;
+    Duration _time;
     bool _startOfBurst;
     bool _endOfBurst;
 }
@@ -93,16 +94,46 @@ struct RxMetaData
     bool hasTimeSpec() @property
     {
         bool b;
-        uhd_rx_metadata_has_time_spec(_handle, &b);
+        uhd_rx_metadata_has_time_spec(_handle, &b).checkUHDError();
         return b;
     }
 
 
-    uhd_rx_metadata_error_code_t errorCode() @property
+    ErrorCode errorCode() @property
     {
         uhd_rx_metadata_error_code_t res;
-        uhd_rx_metadata_error_code(_handle, &res);
-        return res;
+        uhd_rx_metadata_error_code(_handle, &res).checkUHDError();
+        return cast(ErrorCode)res;
+    }
+
+
+    VUHDException getErrorCode(ref ErrorCode errorCode) @nogc nothrow
+    {
+        uhd_rx_metadata_error_code_t res;
+        auto uhderror = uhd_rx_metadata_error_code(_handle, &res);
+        errorCode = cast(ErrorCode)res;
+        return VUHDException(uhderror);
+    }
+
+
+    void printError() @nogc
+    {
+        import core.stdc.stdio : puts;
+        char[1024] strbuf;
+        uhd_rx_metadata_strerror(_handle, strbuf.ptr, strbuf.length - 1);
+        puts(strbuf.ptr);
+    }
+
+
+    enum ErrorCode
+    {
+        NONE = 0x0,
+        TIMEOUT = 0x1,
+        LATE_COMMAND = 0x2,
+        BROKEN_CHAIN = 0x4,
+        OVERFLOW = 0x8,
+        ALIGNMENT = 0xC,
+        BAD_PACKET = 0xF,
     }
 
 
@@ -162,6 +193,13 @@ struct TuneRequest
         _value.target_freq = targetFreq;
         _value.rf_freq_policy = uhd_tune_request_policy_t.AUTO;
         _value.dsp_freq_policy = uhd_tune_request_policy_t.AUTO;
+    }
+
+
+    void args(string s)
+    {
+        import std.string : toStringz;
+        _value.args = cast(char*)s.dup.toStringz();
     }
 
   private:
@@ -242,6 +280,43 @@ struct StreamCommand
         return cmd;
     }
 
+
+    static 
+    StreamCommand numSampsAndDone(size_t samps)
+    {
+        StreamCommand cmd;
+        with(cmd._value){
+            stream_mode = uhd_stream_mode_t.NUM_SAMPS_AND_DONE;
+            num_samps = samps;
+            stream_now = false;
+            time_spec_full_secs = 0;
+            time_spec_frac_secs = 0;
+        }
+
+        return cmd;
+    }
+
+
+    void timeSpec(Duration dur) @property
+    {
+        _value.time_spec_full_secs = dur.total!"seconds";
+        _value.time_spec_frac_secs = (dur.total!"nsecs" - dur.total!"seconds" * 1.0E9L) / 1.0E9L;
+    }
+
+
+    Duration timeSpec() @property 
+    {
+        import std.math;
+        return _value.time_spec_full_secs.seconds + (cast(long)floor(_value.time_spec_frac_secs * 1.0E9)).nsecs;
+    }
+
+
+    bool streamNow() const @property { return _value.stream_now; }
+    
+
+    void streamNow(bool b) @property { _value.stream_now = b; }
+
+
   private:
     uhd_stream_cmd_t _value;
 }
@@ -275,11 +350,50 @@ struct RxStreamer
 
 
     size_t recv(T)(T[] buffer, ref RxMetaData md, double timeout)
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
     {
         size_t res;
         void* p = cast(void*)buffer.ptr;
         uhd_rx_streamer_recv(_handle, &p, buffer.length, &(md._handle), timeout, false, &res).checkUHDError();
         return res;
+    }
+
+
+    size_t recv(T)(T[][] buffers, ref RxMetaData md, double timeout)
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
+    in{
+        assert(buffers.length != 0);
+        immutable len = buffers.length;
+        foreach(buf; buffers) assert(buf.length == len);
+    }
+    body{
+        size_t res;
+        void*[64] buf;
+        foreach(i, b; buffers) buf[i] = b.ptr;
+        uhd_rx_streamer_recv(_handle, buf.ptr, buffers[0].length, &(md._handle), timeout, false, &res).checkUHDError();
+        return res;
+    }
+
+
+    VUHDException recv(T)(T[] buffer, ref RxMetaData md, double timeout, ref size_t size) nothrow @nogc
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
+    {
+        void* p = cast(void*)buffer.ptr;
+        return VUHDException(uhd_rx_streamer_recv(_handle, &p, buffer.length, &(md._handle), timeout, false, &size));
+    }
+
+
+    VUHDException recv(T)(T[][] buffers, ref RxMetaData md, double timeout, ref size_t size) nothrow @nogc
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
+    in{
+        assert(buffers.length != 0);
+        immutable len = buffers.length;
+        foreach(buf; buffers) assert(buf.length == len);
+    }
+    body{
+        void*[64] buf;
+        foreach(i, b; buffers) buf[i] = b.ptr;
+        return VUHDException(uhd_rx_streamer_recv(_handle, buf.ptr, buffers[0].length, &(md._handle), timeout, false, &size));
     }
 
 
@@ -314,6 +428,14 @@ struct TxStreamer
     }
 
 
+    size_t numChannels() @property
+    {
+        size_t res;
+        uhd_tx_streamer_num_channels(_handle, &res);
+        return res;
+    }
+
+
     size_t maxNumSamps() @property
     {
         size_t res;
@@ -322,19 +444,72 @@ struct TxStreamer
     }
 
 
-    size_t send(T)(in T[] buffer, ref TxMetaData metadata, double timeout)
+    size_t send(T)(in T[] buffer, ref TxMetaData metadata, double timeout = 0.1)
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
     {
-        size_t res;
         void* p = cast(void*)buffer.ptr;
-        uhd_tx_streamer_send(_handle, &p, buffer.length, &(metadata._handle), timeout, &res).checkUHDError();
+        size_t dst;
+        uhd_tx_streamer_send(_handle, &p, buffer.length, &(metadata._handle), timeout, &dst).checkUHDError();
+        return dst;
+    }
 
-        return res;
+
+    size_t send(T)(in T[][] buffers, ref TxMetaData metadata, double timeout = 0.1)
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
+    {
+        const(void)*[64] bufs;
+        foreach(i, b; buffers) bufs[i] = b.ptr;
+        size_t dst;
+        uhd_tx_streamer_send(_handle, bufs.ptr, buffers[0].length, &(metadata._handle), timeout, &dst).checkUHDError();
+        return dst;
+    }
+
+
+    VUHDException send(T)(in T[] buffer, ref TxMetaData metadata, double timeout, ref size_t size) nothrow @nogc
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
+    {
+        const(void)* p = buffer.ptr;
+        return VUHDException(uhd_tx_streamer_send(_handle, &p, buffer.length, &(metadata._handle), timeout, &size));
+    }
+
+
+    VUHDException send(T)(in T[][] buffers, ref TxMetaData metadata, double timeout, ref size_t size) nothrow @nogc
+    if((!isArray!T || isStaticArray!T) && isAssignable!T)
+    {
+        const(void)*[64] bufs;
+        foreach(i, b; buffers) bufs[i] = b.ptr;
+        return VUHDException(uhd_tx_streamer_send(_handle, bufs.ptr, buffers.length, &(metadata._handle), timeout, &size));
     }
 
 
   private:
     //USRPHandle _usrpHandle;
     uhd_tx_streamer_handle _handle;
+}
+
+
+struct SubdevSpec
+{
+    this(string markup)
+    {
+        import std.string : toStringz;
+
+        char* cstr = cast(char*)(markup.dup.toStringz);
+        uhd_subdev_spec_make(&_handle, cstr);
+    }
+
+
+    @disable this(this);
+
+
+    ~this()
+    {
+        uhd_subdev_spec_free(&_handle);
+    }
+
+
+  private:
+    uhd_subdev_spec_handle _handle;
 }
 
 
@@ -374,6 +549,9 @@ struct USRPHandle
 
 struct USRP
 {
+    enum size_t ALL_MBOARDS = ~cast(size_t)0;
+
+
     this(string args)
     {
         _handle = USRPHandle(args);
@@ -387,6 +565,36 @@ struct USRP
 
 
     @disable this(this);
+
+
+    void txSubdevSpec(string markup) @property
+    {
+        auto spec = SubdevSpec(markup);
+        uhd_usrp_set_tx_subdev_spec(_handle._handle, spec._handle, ALL_MBOARDS);
+    }
+
+
+    void rxSubdevSpec(string markup) @property
+    {
+        auto spec = SubdevSpec(markup);
+        uhd_usrp_set_rx_subdev_spec(_handle._handle, spec._handle, ALL_MBOARDS);
+    }
+
+
+    size_t txNumChannels() @property
+    {
+        size_t res;
+        uhd_usrp_get_tx_num_channels(_handle._handle, &res).checkUHDError();
+        return res;
+    }
+
+
+    size_t rxNumChannels() @property
+    {
+        size_t res;
+        uhd_usrp_get_rx_num_channels(_handle._handle, &res).checkUHDError();
+        return res;
+    }
 
 
     void txRate(double rate) @property
@@ -419,28 +627,52 @@ struct USRP
 
     void txGain(double gain) @property
     {
-        uhd_usrp_set_tx_gain(_handle._handle, gain, 0, "").checkUHDError();
+        this.setTxGain(gain, 0);
+    }
+
+
+    void setTxGain(double gain, size_t channel = 0)
+    {
+        uhd_usrp_set_tx_gain(_handle._handle, gain, channel, "").checkUHDError();
     }
 
 
     double txGain() @property
     {
+        return this.getTxGain(0);
+    }
+
+
+    double getTxGain(size_t channel = 0) @property
+    {
         double gain;
-        uhd_usrp_get_tx_gain(_handle._handle, 0, "", &gain).checkUHDError();
+        uhd_usrp_get_tx_gain(_handle._handle, channel, "", &gain).checkUHDError();
         return gain;
     }
 
 
     void rxGain(double gain) @property
     {
-        uhd_usrp_set_rx_gain(_handle._handle, gain, 0, "").checkUHDError();
+        this.setRxGain(gain, 0);
+    }
+
+
+    void setRxGain(double gain, size_t channel = 0)
+    {
+        uhd_usrp_set_rx_gain(_handle._handle, gain, channel, "").checkUHDError();
     }
 
 
     double rxGain() @property
     {
+        return this.getRxGain(0);
+    }
+
+
+    double getRxGain(size_t channel = 0)
+    {
         double gain;
-        uhd_usrp_get_rx_gain(_handle._handle, 0, "", &gain).checkUHDError();
+        uhd_usrp_get_rx_gain(_handle._handle, channel, "", &gain).checkUHDError();
         return gain;
     }
 
@@ -448,16 +680,28 @@ struct USRP
     TuneResult txFreq(double freq) @property
     {
         auto req = TuneRequest(freq);
+        return this.tuneTxFreq(req, 0);
+    }
+
+
+    TuneResult tuneTxFreq(ref TuneRequest request, size_t channel = 0)
+    {
         TuneResult res;
-        uhd_usrp_set_tx_freq(_handle._handle, &(req._value), 0, &(res._value)).checkUHDError();
+        uhd_usrp_set_tx_freq(_handle._handle, &(request._value), channel, &(res._value)).checkUHDError();
         return res;
     }
 
 
     double txFreq() @property
     {
+        return getTxFreq(0);
+    }
+
+
+    double getTxFreq(size_t channel) @property
+    {
         double freq;
-        uhd_usrp_get_tx_freq(_handle._handle, 0, &freq).checkUHDError();
+        uhd_usrp_get_tx_freq(_handle._handle, channel, &freq).checkUHDError();
         return freq;
     }
 
@@ -465,16 +709,28 @@ struct USRP
     TuneResult rxFreq(double freq) @property
     {
         auto req = TuneRequest(freq);
+        return tuneRxFreq(req, 0);
+    }
+
+
+    TuneResult tuneRxFreq(ref TuneRequest request, size_t channel = 0)
+    {
         TuneResult res;
-        uhd_usrp_set_rx_freq(_handle._handle, &(req._value), 0, &(res._value)).checkUHDError();
+        uhd_usrp_set_rx_freq(_handle._handle, &(request._value), channel, &(res._value)).checkUHDError();
         return res;
     }
 
 
     double rxFreq() @property
     {
+        return this.getRxFreq(0);
+    }
+
+
+    double getRxFreq(size_t channel = 0)
+    {
         double freq;
-        uhd_usrp_get_rx_freq(_handle._handle, 0, &freq).checkUHDError();
+        uhd_usrp_get_rx_freq(_handle._handle, channel, &freq).checkUHDError();
         return freq;
     }
 
@@ -491,7 +747,7 @@ struct USRP
         import std.conv : to;
 
         char[32] buffer;
-        uhd_usrp_get_clock_source(_handle._handle, 0, buffer.ptr, 32);
+        uhd_usrp_get_clock_source(_handle._handle, 0, buffer.ptr, 32).checkUHDError();
         return buffer.ptr.to!string;
     }
 
@@ -509,8 +765,131 @@ struct USRP
         import std.conv : to;
 
         char[32] buffer;
-        uhd_usrp_get_time_source(_handle._handle, 0, buffer.ptr, 16);
+        uhd_usrp_get_time_source(_handle._handle, 0, buffer.ptr, 16).checkUHDError();
         return buffer.ptr.to!string;
+    }
+
+
+    void timeNow(Duration timeSpec) @property
+    {
+        this.setTimeNow(timeSpec, 0);
+    }
+
+
+    void setTimeNow(Duration timeSpec, size_t mboard = 0)
+    {
+        auto uhdtime = timeSpec.splitToFullAndFracSecs();
+        uhd_usrp_set_time_now(_handle._handle, uhdtime[0], uhdtime[1], mboard).checkUHDError();
+    }
+
+
+    void setTxAntenna(string antenna, size_t channel = 0)
+    {
+        import std.string : toStringz;
+        uhd_usrp_set_tx_antenna(_handle._handle, antenna.toStringz, channel).checkUHDError();
+    }
+
+
+    void txAntenna(string antenna) @property
+    {
+        this.setTxAntenna(antenna, 0);
+    }
+
+
+    string getTxAntenna(size_t channel = 0)
+    {
+        import core.stdc.string : strlen;
+        char[1024] str;
+        uhd_usrp_get_tx_antenna(_handle._handle, channel, str.ptr, str.length - 1).checkUHDError();
+        size_t len = strlen(str.ptr);
+        return str[0 .. len].dup;
+    }
+
+
+    string txAntenna() @property
+    {
+        return this.getTxAntenna(0);
+    }
+
+
+    void setRxAntenna(string antenna, size_t channel = 0)
+    {
+        import std.string : toStringz;
+        uhd_usrp_set_rx_antenna(_handle._handle, antenna.toStringz, channel).checkUHDError();
+    }
+
+
+    void rxAntenna(string antenna) @property
+    {
+        this.setRxAntenna(antenna, 0);
+    }
+
+
+    string getRxAntenna(size_t channel = 0)
+    {
+        import core.stdc.string : strlen;
+        char[1024] str;
+        uhd_usrp_get_rx_antenna(_handle._handle, channel, str.ptr, str.length - 1).checkUHDError();
+        size_t len = strlen(str.ptr);
+        return str[0 .. len].dup;
+    }
+
+
+    string rxAntenna() @property
+    {
+        return this.getRxAntenna(0);
+    }
+
+
+    void setTxBandwidth(double bw, size_t channel = 0)
+    {
+        uhd_usrp_set_tx_bandwidth(_handle._handle, bw, channel).checkUHDError();
+    }
+
+
+    void txBandwidth(double bw)
+    {
+        this.setTxBandwidth(bw, 0);
+    }
+
+
+    double getTxBandwidth(size_t channel = 0)
+    {
+        double bw;
+        uhd_usrp_get_tx_bandwidth(_handle._handle, channel, &bw).checkUHDError();
+        return bw;
+    }
+
+
+    double txBandwidth()
+    {
+        return this.getTxBandwidth(0);
+    }
+
+
+    void setRxBandwidth(double bw, size_t channel = 0)
+    {
+        uhd_usrp_set_rx_bandwidth(_handle._handle, bw, channel).checkUHDError();
+    }
+
+
+    void rxBandwidth(double bw)
+    {
+        this.setRxBandwidth(bw, 0);
+    }
+
+
+    double getRxBandwidth(size_t channel = 0)
+    {
+        double bw;
+        uhd_usrp_get_rx_bandwidth(_handle._handle, channel, &bw).checkUHDError();
+        return bw;
+    }
+
+
+    double rxBandwidth()
+    {
+        return this.getRxBandwidth(0);
     }
 
 
@@ -525,6 +904,212 @@ struct USRP
         return TxStreamer(_handle, args);
     }
 
+
+    StringList getTxSensorNames(size_t channel)
+    {
+        uhd_string_vector_handle slist;
+        uhd_usrp_get_tx_sensor_names(_handle._handle, channel, &slist).checkUHDError();
+        return StringList(slist);
+    }
+
+
+    StringList getRxSensorNames(size_t channel)
+    {
+        uhd_string_vector_handle slist;
+        uhd_usrp_get_rx_sensor_names(_handle._handle, channel, &slist).checkUHDError();
+        return StringList(slist);
+    }
+
+
+    StringList getMboardSensorNames(size_t mboard)
+    {
+        uhd_string_vector_handle slist;
+        uhd_usrp_get_mboard_sensor_names(_handle._handle, mboard, &slist).checkUHDError();
+        return StringList(slist);
+    }
+
+
+    SensorValue getTxSensor(const(char)[] name, size_t channel)
+    {
+        import std.string : toStringz;
+
+        uhd_sensor_value_handle handle;
+        uhd_usrp_get_tx_sensor(_handle._handle, name.toStringz, channel, &handle);
+        return SensorValue(handle);
+    }
+
+
+    SensorValue getRxSensor(const(char)[] name, size_t channel)
+    {
+        import std.string : toStringz;
+
+        uhd_sensor_value_handle handle;
+        uhd_usrp_get_rx_sensor(_handle._handle, name.toStringz, channel, &handle);
+        return SensorValue(handle);
+    }
+
+
+    SensorValue getMBoardSensor(const(char)[] name, size_t channel)
+    {
+        import std.string : toStringz;
+
+        uhd_sensor_value_handle handle;
+        uhd_usrp_get_mboard_sensor(_handle._handle, name.toStringz, channel, &handle);
+        return SensorValue(handle);
+    }
+
+
+    void toString(scope void delegate(const(char)[]) sink)
+    {
+        import core.stdc.string : strlen;
+
+        char[1024] str;
+        uhd_usrp_get_pp_string(_handle._handle, str.ptr, str.length - 1).checkUHDError();
+        size_t len = strlen(str.ptr);
+        sink(str[0 .. len]);
+    }
+
+
   private:
     USRPHandle _handle;
+}
+
+
+struct StringList
+{
+    this(uhd_string_vector_handle handle)
+    {
+        _handle = handle;
+        _index = 0;
+        uhd_string_vector_size(_handle, &_size).checkUHDError();
+    }
+
+
+    @disable this(this);
+
+
+    ~this()
+    {
+        if(_handle !is null)
+            uhd_string_vector_free(&_handle);
+
+        _handle = null;
+    }
+
+
+    size_t length() const @property { return _size - _index; }
+
+
+    int opApply(scope int delegate(char[]) dg)
+    {
+        return this.opApply((size_t i, char[] str){
+            return dg(str);
+        });
+    }
+
+
+    int opApply(scope int delegate(size_t, char[]) dg)
+    {
+        import core.stdc.string : strlen;
+
+        int result;
+        foreach(i; _index .. _size){
+            char[1024] strbuf;
+            uhd_string_vector_at(_handle, _index, strbuf.ptr, strbuf.length - 1).checkUHDError();
+            size_t len = strlen(strbuf.ptr);
+            result = dg(i - _index, strbuf[0 .. len]);
+            if(result) break;
+        }
+
+        return result;
+    }
+    
+
+  private:
+    uhd_string_vector_handle _handle;
+    size_t _index;
+    size_t _size;
+}
+
+
+struct SensorList
+{
+
+}
+
+
+struct SensorValue
+{
+    this(uhd_sensor_value_handle handle)
+    {
+        _handle = handle;
+    }
+
+
+    @disable this(this);
+
+
+    ~this()
+    {
+        if(_handle !is null)
+            uhd_sensor_value_free(&_handle);
+
+        _handle = null;
+    }
+
+
+    bool has(T)() @property
+    if(is(T == bool) || is(T : long) || is(T : real) || is(T == string))
+    {
+        uhd_sensor_value_data_type_t type;
+        uhd_sensor_value_data_type(_handle, &type);
+
+        if(is(T == bool) && type == UHD_SENSOR_VALUE_BOOLEAN)
+            return true;
+        else if(is(T : long) && type == UHD_SENSOR_VALUE_INTEGER)
+            return true;
+        else if(is(T : real) && type == UHD_SENSOR_VALUE_REALNUM)
+            return true;
+        else if(is(T == string) && type == UHD_SENSOR_VALUE_STRING)
+            return true;
+        else
+            return false;
+    }
+
+
+    T opCast(T)()
+    if(is(T == bool) || is(T : long) || is(T : real) || is(T == string))
+    {
+        static if(is(T == bool)){
+            bool value;
+            uhd_sensor_value_to_bool(_handle, &value);
+            return value;
+        }else static if(is(T : long)){
+            int value;
+            uhd_sensor_value_to_int(_handle, &value).checkUHDError();
+            return cast(T)value;
+        }else static if(is(T : real)){
+            double value;
+            uhd_sensor_value_to_realnum(_handle, &value).checkUHDError();
+            return value;
+        }else static if(is(T == string)){
+            return this.to!string();
+        }else
+            static assert(0, T.stringof ~ " is unsupported.");
+    }
+
+
+    void toString(scope void delegate(const(char)[]) sink)
+    {
+        import core.stdc.string;
+
+        char[1024] strbuf;
+        uhd_sensor_value_to_pp_string(_handle, strbuf.ptr, strbuf.length - 1).checkUHDError();
+        size_t len = strlen(strbuf.ptr);
+        sink(strbuf[0 .. len]);
+    }
+
+
+  private:
+    uhd_sensor_value_handle _handle;
 }

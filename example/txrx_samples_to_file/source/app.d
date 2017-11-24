@@ -15,13 +15,30 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 
+import std.complex;
+import std.math;
+import std.stdio;
+import std.path;
+import std.format;
+import std.string;
+import std.getopt;
+import std.range;
+import std.algorithm;
+import std.conv;
+import std.exception;
+import std.meta;
 import uhd.usrp;
+import uhd.capi;
+import uhd.utils;
+import core.time;
+import core.thread;
+
 
 /***********************************************************************
  * Signal handlers
  **********************************************************************/
-bool stop_signal_called = false;
-void sig_int_handler(int)
+shared bool stop_signal_called = false;
+extern(C) void sig_int_handler(int) nothrow @nogc @system
 {
     stop_signal_called = true;
 }
@@ -46,425 +63,421 @@ string generate_out_filename(string base_fn, size_t n_names, size_t this_name)
  * A function to be used as a boost::thread_group thread for transmitting
  **********************************************************************/
 void transmit_worker(
-    immutable(Complex!float)[] buff,
-    wave_table_class wave_table,
-    uhd::tx_streamer::sptr tx_streamer,
-    uhd::tx_metadata_t metadata,
-    size_t step,
-    size_t index,
-    int num_channels
+    size_t samplesPerBuffer,
+    immutable(Complex!float[])[] wave_table,
+    ref TxStreamer tx_streamer,
+    ref TxMetaData metadata,
+    size_t num_channels
 ){
-    std::vector<std::complex<float> *> buffs(num_channels, &buff.front());
+    Complex!float[][] buffs = new Complex!float[][](num_channels, samplesPerBuffer);
+    size_t[] indexList = new size_t[num_channels];
+    TxMetaData afterFirstMD = TxMetaData(false, 0, 0, false, false);
+    TxMetaData endMD = TxMetaData(false, 0, 0, false, true);
+    TxMetaData* mdp = &metadata;
+    VUHDException error;
 
     //send data until the signal handler gets called
-    while(not stop_signal_called){
-        //fill the buffer with the waveform
-        for (size_t n = 0; n < buff.size(); n++){
-            buff[n] = wave_table(index += step);
+    () @nogc {
+        while(!stop_signal_called){
+            //fill the buffer with the waveform
+            foreach(ch; 0 .. num_channels){
+                foreach(n; 0 .. samplesPerBuffer){
+                    indexList[ch] += 1;
+                    buffs[ch][n] = wave_table[ch][indexList[ch] % $];
+                }
+            }
+
+            //send the entire contents of the buffer
+            size_t txsize;
+            if(auto err =tx_streamer.send(buffs, *mdp, 0.1, txsize)){
+                error = err;
+                return;
+            }
+
+            if(mdp !is &afterFirstMD)
+                mdp = &afterFirstMD;
         }
-
-        //send the entire contents of the buffer
-        tx_streamer->send(buffs, buff.size(), metadata);
-
-        metadata.start_of_burst = false;
-        metadata.has_time_spec = false;
-    }
+    }();
 
     //send a mini EOB packet
-    metadata.end_of_burst = true;
-    tx_streamer->send("", 0, metadata);
+    foreach(ref e; buffs) e.length = 0;
+    tx_streamer.send(buffs, endMD, 0.1);
+
+    if(error)
+        throw error.makeException();
 }
 
 
 /***********************************************************************
  * recv_to_file function
  **********************************************************************/
-template<typename samp_type> void recv_to_file(
-    uhd::usrp::multi_usrp::sptr usrp,
-    const std::string &cpu_format,
-    const std::string &wire_format,
-    const std::string &file,
+void recv_to_file(E)(
+    ref USRP usrp,
+    string cpu_format,
+    string wire_format,
+    string file,
     size_t samps_per_buff,
-    int num_requested_samples,
+    size_t num_requested_samples,
     float settling_time,
-    std::vector<size_t> rx_channel_nums
+    immutable(size_t)[] rx_channel_nums
 ){
     int num_total_samps = 0;
     //create a receive streamer
-    uhd::stream_args_t stream_args(cpu_format,wire_format);
-    stream_args.channels = rx_channel_nums;
-    uhd::rx_streamer::sptr rx_stream = usrp->get_rx_stream(stream_args);
+    StreamArgs stream_args = StreamArgs(cpu_format, wire_format, "", rx_channel_nums);
+    RxStreamer rx_stream = usrp.makeRxStreamer(stream_args);
 
     // Prepare buffers for received samples and metadata
-    uhd::rx_metadata_t md;
-    std::vector <std::vector< samp_type > > buffs(
-        rx_channel_nums.size(), std::vector< samp_type >(samps_per_buff)
-    );
+    RxMetaData md;
+    E[][] buffs = new E[][](rx_channel_nums.length, samps_per_buff);
+
     //create a vector of pointers to point to each of the channel buffers
-    std::vector<samp_type *> buff_ptrs;
-    for (size_t i = 0; i < buffs.size(); i++) {
-        buff_ptrs.push_back(&buffs[i].front());
-    }
+    E*[] buff_ptrs;
+    for (size_t i = 0; i < buffs.length; i++)
+        buff_ptrs ~= buffs[i].ptr;
 
     // Create one ofstream object per channel
-    // (use shared_ptr because ofstream is non-copyable)
-    std::vector<boost::shared_ptr<std::ofstream> > outfiles;
-    for (size_t i = 0; i < buffs.size(); i++) {
-        const std::string this_filename = generate_out_filename(file, buffs.size(), i);
-        outfiles.push_back(boost::shared_ptr<std::ofstream>(new std::ofstream(this_filename.c_str(), std::ofstream::binary)));
+    import core.stdc.stdio : FILE, fwrite, fopen, fclose;
+    FILE*[] outfiles;
+    scope(exit){
+        foreach(ref f; outfiles){
+            fclose(f);
+            f = null;
+        }
     }
-    UHD_ASSERT_THROW(outfiles.size() == buffs.size());
-    UHD_ASSERT_THROW(buffs.size() == rx_channel_nums.size());
+    for (size_t i = 0; i < buffs.length; i++) {
+        string this_filename = generate_out_filename(file, buffs.length, i);
+        FILE* fp = fopen(this_filename.toStringz, "wb");
+        if(fp is null) throw new Exception("Cannot open file: " ~ this_filename);
+        outfiles ~= fp;
+    }
+    enforce(outfiles.length == buffs.length);
+    enforce(buffs.length == rx_channel_nums.length);
     bool overflow_message = true;
     float timeout = settling_time + 0.1f; //expected settling time + padding for first recv
 
     //setup streaming
-    uhd::stream_cmd_t stream_cmd((num_requested_samples == 0)?
-        uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS:
-        uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE
-    );
-    stream_cmd.num_samps = num_requested_samples;
-    stream_cmd.stream_now = false;
-    stream_cmd.time_spec = uhd::time_spec_t(settling_time);
-    rx_stream->issue_stream_cmd(stream_cmd);
+    StreamCommand stream_cmd = num_requested_samples == 0 ?
+        StreamCommand.startContinuous :
+        StreamCommand.numSampsAndDone(num_requested_samples);
 
-    while(not stop_signal_called and (num_requested_samples > num_total_samps or num_requested_samples == 0)){
-        size_t num_rx_samps = rx_stream->recv(buff_ptrs, samps_per_buff, md, timeout);
-        timeout = 0.1f; //small timeout for subsequent recv
+    stream_cmd.streamNow = false;
+    stream_cmd.timeSpec = (cast(long)floor(settling_time*1E6)).usecs;
+    rx_stream.issue(stream_cmd);
 
-        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) {
-            std::cout << boost::format("Timeout while streaming") << std::endl;
-            break;
-        }
-        if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW){
-            if (overflow_message){
-                overflow_message = false;
-                std::cerr << boost::format(
-                    "Got an overflow indication. Please consider the following:\n"
-                    "  Your write medium must sustain a rate of %fMB/s.\n"
-                    "  Dropped samples will not be written to the file.\n"
-                    "  Please modify this example for your purposes.\n"
-                    "  This message will not appear again.\n"
-                ) % (usrp->get_rx_rate()*sizeof(samp_type)/1e6);
+    VUHDException error;
+    () @nogc {
+        while(! stop_signal_called && (num_requested_samples > num_total_samps || num_requested_samples == 0)){
+            // size_t num_rx_samps = rx_stream.recv(buff_ptrs, samps_per_buff, md, timeout);
+            size_t num_rx_samps;
+            if(auto err = rx_stream.recv(buffs, md, timeout, num_rx_samps)){
+                error = err;
+                return;
             }
-            continue;
-        }
-        if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE){
-            throw std::runtime_error(str(boost::format(
-                "Receiver error %s"
-            ) % md.strerror()));
-        }
+            timeout = 0.1f; //small timeout for subsequent recv
 
-        num_total_samps += num_rx_samps;
+            md.ErrorCode errorCode;
+            if(auto uhderr = md.getErrorCode(errorCode)){
+                error = uhderr;
+                return;
+            }
+            if (errorCode == md.ErrorCode.TIMEOUT) {
+                import core.stdc.stdio : puts;
+                puts("Timeout while streaming");
+                break;
+            }
+            if (errorCode == md.ErrorCode.OVERFLOW) {
+                if (overflow_message){
+                    import core.stdc.stdio : fprintf, stderr;
+                    overflow_message = false;
+                    fprintf(stderr, "Got an overflow indication.");
+                }
+                continue;
+            }
+            if (errorCode != md.ErrorCode.NONE){
+                import core.stdc.stdio : fprintf, stderr;
+                md.printError();
+                fprintf(stderr, "Unknown error.");
+            }
 
-        for (size_t i = 0; i < outfiles.size(); i++) {
-            outfiles[i]->write((const char*) buff_ptrs[i], num_rx_samps*sizeof(samp_type));
+            num_total_samps += num_rx_samps;
+
+            foreach(i, ref f; outfiles){
+                fwrite(buffs[i].ptr, E.sizeof, buffs[i].length, f);
+            }
         }
-    }
+    }();
 
     // Shut down receiver
-    stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
-    rx_stream->issue_stream_cmd(stream_cmd);
+    rx_stream.issue(StreamCommand.stopContinuous);
 
-    // Close files
-    for (size_t i = 0; i < outfiles.size(); i++) {
-        outfiles[i]->close();
-    }
+    if(error)
+        throw error.makeException();
 }
 
 
 /***********************************************************************
  * Main function
  **********************************************************************/
-int SAFE_MAIN(int argc, char *argv[]){
-    uhd::set_thread_priority_safe();
+void main(string[] args){
+    uhd_set_thread_priority(uhd_default_thread_priority, true);
 
     //transmit variables to be set by po
-    std::string tx_args, wave_type, tx_ant, tx_subdev, ref, otw, tx_channels;
-    double tx_rate, tx_freq, tx_gain, wave_freq, tx_bw;
+    string[] txfiles;
+    string tx_args, /*wave_type,*/ tx_ant, tx_subdev, ref_, otw, tx_channels;
+    double tx_rate, tx_freq, tx_gain, /*wave_freq,*/ tx_bw;
     float ampl;
 
     //receive variables to be set by po
-    std::string rx_args, file, type, rx_ant, rx_subdev, rx_channels;
+    string rx_args, file, type, rx_ant, rx_subdev, rx_channels;
     size_t total_num_samps, spb;
     double rx_rate, rx_freq, rx_gain, rx_bw;
     float settling;
+    bool tx_int_n, rx_int_n;
 
-    //setup the program options
-    po::options_description desc("Allowed options");
-    desc.add_options()
-        ("help", "help message")
-        ("tx-args", po::value<std::string>(&tx_args)->default_value(""), "uhd transmit device address args")
-        ("rx-args", po::value<std::string>(&rx_args)->default_value(""), "uhd receive device address args")
-        ("file", po::value<std::string>(&file)->default_value("usrp_samples.dat"), "name of the file to write binary samples to")
-        ("type", po::value<std::string>(&type)->default_value("short"), "sample type in file: double, float, or short")
-        ("nsamps", po::value<size_t>(&total_num_samps)->default_value(0), "total number of samples to receive")
-        ("settling", po::value<float>(&settling)->default_value(float(0.2)), "settling time (seconds) before receiving")
-        ("spb", po::value<size_t>(&spb)->default_value(0), "samples per buffer, 0 for default")
-        ("tx-rate", po::value<double>(&tx_rate), "rate of transmit outgoing samples")
-        ("rx-rate", po::value<double>(&rx_rate), "rate of receive incoming samples")
-        ("tx-freq", po::value<double>(&tx_freq), "transmit RF center frequency in Hz")
-        ("rx-freq", po::value<double>(&rx_freq), "receive RF center frequency in Hz")
-        ("ampl", po::value<float>(&ampl)->default_value(float(0.3)), "amplitude of the waveform [0 to 0.7]")
-        ("tx-gain", po::value<double>(&tx_gain), "gain for the transmit RF chain")
-        ("rx-gain", po::value<double>(&rx_gain), "gain for the receive RF chain")
-        ("tx-ant", po::value<std::string>(&tx_ant), "transmit antenna selection")
-        ("rx-ant", po::value<std::string>(&rx_ant), "receive antenna selection")
-        ("tx-subdev", po::value<std::string>(&tx_subdev), "transmit subdevice specification")
-        ("rx-subdev", po::value<std::string>(&rx_subdev), "receive subdevice specification")
-        ("tx-bw", po::value<double>(&tx_bw), "analog transmit filter bandwidth in Hz")
-        ("rx-bw", po::value<double>(&rx_bw), "analog receive filter bandwidth in Hz")
-        ("wave-type", po::value<std::string>(&wave_type)->default_value("CONST"), "waveform type (CONST, SQUARE, RAMP, SINE)")
-        ("wave-freq", po::value<double>(&wave_freq)->default_value(0), "waveform frequency in Hz")
-        ("ref", po::value<std::string>(&ref)->default_value("internal"), "clock reference (internal, external, mimo)")
-        ("otw", po::value<std::string>(&otw)->default_value("sc16"), "specify the over-the-wire sample mode")
-        ("tx-channels", po::value<std::string>(&tx_channels)->default_value("0"), "which TX channel(s) to use (specify \"0\", \"1\", \"0,1\", etc)")
-        ("rx-channels", po::value<std::string>(&rx_channels)->default_value("0"), "which RX channel(s) to use (specify \"0\", \"1\", \"0,1\", etc)")
-        ("tx-int-n", "tune USRP TX with integer-N tuning")
-        ("rx-int-n", "tune USRP RX with integer-N tuning")
-    ;
-    po::variables_map vm;
-    po::store(po::parse_command_line(argc, argv, desc), vm);
-    po::notify(vm);
+    // set default values
+    file = "usrp_samples.dat";
+    type = "short";
+    ampl = 0.3;
+    settling = 0.2;
+    // wave_freq = 0;
 
-    //print the help message
-    if (vm.count("help")){
-        std::cout << boost::format("UHD TXRX Loopback to File %s") % desc << std::endl;
-        return ~0;
+    auto helpInformation = getopt(
+        args,
+        "tx-args",  "uhd transmit device address args",             &tx_args,
+        "rx-args",  "uhd receive device address args",              &rx_args,
+        "file",     "name of the file to write binary samples to",  &file,
+        "type",     "sample type in file: double, float, or short", &type,
+        "nsamps",   "total number of samples to receive",           &total_num_samps,
+        "settling", "total time (seconds) before receiving",        &settling,
+        "spb",      "samples per buffer, 0 for default",            &spb,
+        "tx-rate",  "rate of transmit outgoing samples",            &tx_rate,
+        "rx-rate",  "rate of receive incoming samples",             &rx_rate,
+        "tx-freq",  "transmit RF center frequency in Hz",           &tx_freq,
+        "rx-freq",  "receive RF center frequency in Hz",            &rx_freq,
+        "ampl",     "amplitude of the waveform [0 to 0.7]",         &ampl,
+        "tx-gain",  "gain for the transmit RF chain",               &tx_gain,
+        "rx-gain",  "gain for the receive RF chain",                &rx_gain,
+        "tx-ant",   "transmit antenna selection",                   &tx_ant,
+        "rx-and",   "receive antenna selection",                    &rx_ant,
+        "tx-subdev",    "transmit subdevice specification",         &tx_subdev,
+        "rx-subdev",    "receive subdevice specification",          &rx_subdev,
+        "tx-bw",    "analog transmit filter bandwidth in Hz",       &tx_bw,
+        "rx-bw",    "analog receive filter bandwidth in Hz",        &rx_bw,
+        "txfiles",  "transmit waveform file",                       &txfiles, 
+        // "wave-type",    "waveform type (CONST, SQUARE, RAMP, SINE)",    &wave_type,
+        // "wave-freq",    "waveform frequency in Hz",                 &wave_freq,
+        "ref",      "clock reference (internal, external, mimo)",   &ref_,
+        "otw",      "specify the over-the-wire sample mode",        &otw,
+        "tx-channels",  `which TX channel(s) to use (specify "0", "1", "0,1", etc)`,    &tx_channels,
+        "rx-channels",  `which RX channel(s) to use (specify "0", "1", "0,1", etc)`,    &rx_channels,
+        "tx_int_n", "tune USRP TX with integer-N tuing", &tx_int_n,
+        "rx_int_n", "tune USRP RX with integer-N tuing", &rx_int_n,
+    );
+
+    if(helpInformation.helpWanted){
+        defaultGetoptPrinter("UHD TXRX Loopback to File.", helpInformation.options);
+        return;
     }
 
-    //create a usrp device
-    std::cout << std::endl;
-    std::cout << boost::format("Creating the transmit usrp device with: %s...") % tx_args << std::endl;
-    uhd::usrp::multi_usrp::sptr tx_usrp = uhd::usrp::multi_usrp::make(tx_args);
-    std::cout << std::endl;
-    std::cout << boost::format("Creating the receive usrp device with: %s...") % rx_args << std::endl;
-    uhd::usrp::multi_usrp::sptr rx_usrp = uhd::usrp::multi_usrp::make(rx_args);
+    writefln("Creating the transmit usrp device with: %s...", tx_args);
+    USRP tx_usrp = USRP(tx_args);
+    writefln("Creating the receive usrp device with: %s...", rx_args);
+    USRP rx_usrp = USRP(rx_args);
 
     //detect which channels to use
-    std::vector<std::string> tx_channel_strings;
-    std::vector<size_t> tx_channel_nums;
-    boost::split(tx_channel_strings, tx_channels, boost::is_any_of("\"',"));
-    for(size_t ch = 0; ch < tx_channel_strings.size(); ch++){
-        size_t chan = boost::lexical_cast<int>(tx_channel_strings[ch]);
-        if(chan >= tx_usrp->get_tx_num_channels()){
-            throw std::runtime_error("Invalid TX channel(s) specified.");
-        }
-        else tx_channel_nums.push_back(boost::lexical_cast<int>(tx_channel_strings[ch]));
-    }
-    std::vector<std::string> rx_channel_strings;
-    std::vector<size_t> rx_channel_nums;
-    boost::split(rx_channel_strings, rx_channels, boost::is_any_of("\"',"));
-    for(size_t ch = 0; ch < rx_channel_strings.size(); ch++){
-        size_t chan = boost::lexical_cast<int>(rx_channel_strings[ch]);
-        if(chan >= rx_usrp->get_rx_num_channels()){
-            throw std::runtime_error("Invalid RX channel(s) specified.");
-        }
-        else rx_channel_nums.push_back(boost::lexical_cast<int>(rx_channel_strings[ch]));
-    }
+    // std::vector<std::string> tx_channel_strings;
+    // std::vector<size_t> tx_channel_nums;
+    // boost::split(tx_channel_strings, tx_channels, boost::is_any_of("\"',"));
+    // for(size_t ch = 0; ch < tx_channel_strings.size(); ch++){
+    //     size_t chan = boost::lexical_cast<int>(tx_channel_strings[ch]);
+    //     if(chan >= tx_usrp->get_tx_num_channels()){
+    //         throw std::runtime_error("Invalid TX channel(s) specified.");
+    //     }
+    //     else tx_channel_nums.push_back(boost::lexical_cast<int>(tx_channel_strings[ch]));
+    // }
+    immutable(size_t)[] tx_channel_nums = tx_channels.splitter(',').map!(to!size_t).array();
+    enforce(tx_channel_nums.length == txfiles.length, "The number of channels is not equal to the number of txfiles.");
+    foreach(e; tx_channel_nums) enforce(e < tx_usrp.txNumChannels, "Invalid TX channel(s) specified.");
+
+    immutable(size_t)[] rx_channel_nums = rx_channels.splitter(',').map!(to!size_t).array();
+    foreach(e; rx_channel_nums) enforce(e < rx_usrp.rxNumChannels, "Invalid RX channel(s) specified.");
 
     //Lock mboard clocks
-    tx_usrp->set_clock_source(ref);
-    rx_usrp->set_clock_source(ref);
+    tx_usrp.clockSource = ref_;
+    rx_usrp.clockSource = ref_;
 
     //always select the subdevice first, the channel mapping affects the other settings
-    if (vm.count("tx-subdev")) tx_usrp->set_tx_subdev_spec(tx_subdev);
-    if (vm.count("rx-subdev")) rx_usrp->set_rx_subdev_spec(rx_subdev);
+    // if (vm.count("tx-subdev")) tx_usrp->set_tx_subdev_spec(tx_subdev);
+    // if (vm.count("rx-subdev")) rx_usrp->set_rx_subdev_spec(rx_subdev);
+    if(! tx_subdev.empty) tx_usrp.txSubdevSpec = tx_subdev;
+    if(! rx_subdev.empty) rx_usrp.rxSubdevSpec = rx_subdev;
 
-    std::cout << boost::format("Using TX Device: %s") % tx_usrp->get_pp_string() << std::endl;
-    std::cout << boost::format("Using RX Device: %s") % rx_usrp->get_pp_string() << std::endl;
+    static if(0){
+        writeln("Using TX Device: ", tx_usrp);
+        writeln("Using RX Device: ", rx_usrp);
+    }
 
     //set the transmit sample rate
-    if (not vm.count("tx-rate")){
-        std::cerr << "Please specify the transmit sample rate with --tx-rate" << std::endl;
-        return ~0;
+    if (tx_rate.isNaN){
+        writeln("Please specify the transmit sample rate with --tx-rate");
+        return;
     }
-    std::cout << boost::format("Setting TX Rate: %f Msps...") % (tx_rate/1e6) << std::endl;
-    tx_usrp->set_tx_rate(tx_rate);
-    std::cout << boost::format("Actual TX Rate: %f Msps...") % (tx_usrp->get_tx_rate()/1e6) << std::endl << std::endl;
+
+    writefln("Setting TX Rate: %f Msps...", tx_rate/1e6);
+    tx_usrp.txRate = tx_rate;
+    writefln("Actual TX Rate: %f Msps...", tx_usrp.txRate/1e6);
 
     //set the receive sample rate
-    if (not vm.count("rx-rate")){
-        std::cerr << "Please specify the sample rate with --rx-rate" << std::endl;
-        return ~0;
+    if (rx_rate.isNaN){
+        writeln("Please specify the sample rate with --rx-rate");
+        return;
     }
-    std::cout << boost::format("Setting RX Rate: %f Msps...") % (rx_rate/1e6) << std::endl;
-    rx_usrp->set_rx_rate(rx_rate);
-    std::cout << boost::format("Actual RX Rate: %f Msps...") % (rx_usrp->get_rx_rate()/1e6) << std::endl << std::endl;
+    writefln("Setting RX Rate: %f Msps...", rx_rate/1e6);
+    rx_usrp.rxRate = rx_rate;
+    writefln("Actual RX Rate: %f Msps...", rx_usrp.rxRate/1e6);
 
     //set the transmit center frequency
-    if (not vm.count("tx-freq")){
-        std::cerr << "Please specify the transmit center frequency with --tx-freq" << std::endl;
-        return ~0;
+    if (tx_freq.isNaN) {
+        writeln("Please specify the transmit center frequency with --tx-freq");
+        return;
     }
 
-    for(size_t ch = 0; ch < tx_channel_nums.size(); ch++) {
-        size_t channel = tx_channel_nums[ch];
-        if (tx_channel_nums.size() > 1) {
-            std::cout << "Configuring TX Channel " << channel << std::endl;
+    // for(size_t ch = 0; ch < tx_channel_nums.size(); ch++) {
+    foreach(channel; tx_channel_nums){
+        if (tx_channel_nums.length > 1) {
+            writefln("Configuring TX Channel %s", channel);
         }
-        std::cout << boost::format("Setting TX Freq: %f MHz...") % (tx_freq/1e6) << std::endl;
-        uhd::tune_request_t tx_tune_request(tx_freq);
-        if(vm.count("tx-int-n")) tx_tune_request.args = uhd::device_addr_t("mode_n=integer");
-        tx_usrp->set_tx_freq(tx_tune_request, channel);
-        std::cout << boost::format("Actual TX Freq: %f MHz...") % (tx_usrp->get_tx_freq(channel)/1e6) << std::endl << std::endl;
+        writefln("Setting TX Freq: %f MHz...", tx_freq/1e6);
+        TuneRequest tx_tune_request = TuneRequest(tx_freq);
+        if(tx_int_n) tx_tune_request.args = "mode_n=integer";
+        tx_usrp.tuneTxFreq(tx_tune_request, channel);
+        writefln("Actual TX Freq: %f MHz...", tx_usrp.getTxFreq(channel)/1e6);
 
         //set the rf gain
-        if (vm.count("tx-gain")){
-            std::cout << boost::format("Setting TX Gain: %f dB...") % tx_gain << std::endl;
-            tx_usrp->set_tx_gain(tx_gain, channel);
-            std::cout << boost::format("Actual TX Gain: %f dB...") % tx_usrp->get_tx_gain(channel) << std::endl << std::endl;
+        if (! tx_gain.isNaN) {
+            writefln("Setting TX Gain: %f dB...", tx_gain);
+            tx_usrp.setTxGain(tx_gain, channel);
+            writefln("Actual TX Gain: %f dB...", tx_usrp.getTxGain(channel));
         }
 
         //set the analog frontend filter bandwidth
-        if (vm.count("tx-bw")){
-            std::cout << boost::format("Setting TX Bandwidth: %f MHz...") % tx_bw << std::endl;
-            tx_usrp->set_tx_bandwidth(tx_bw, channel);
-            std::cout << boost::format("Actual TX Bandwidth: %f MHz...") % tx_usrp->get_tx_bandwidth(channel) << std::endl << std::endl;
+        if (! tx_bw.isNaN){
+            writefln("Setting TX Bandwidth: %f MHz...", tx_bw);
+            tx_usrp.setTxBandwidth(tx_bw, channel);
+            writefln("Actual TX Bandwidth: %f MHz...", tx_usrp.getTxBandwidth(channel));
         }
 
         //set the antenna
-        if (vm.count("tx-ant")) tx_usrp->set_tx_antenna(tx_ant, channel);
+        if (! tx_ant.empty) tx_usrp.setTxAntenna(tx_ant, channel);
     }
 
-    for(size_t ch = 0; ch < rx_channel_nums.size(); ch++) {
-        size_t channel = rx_channel_nums[ch];
-        if (rx_channel_nums.size() > 1) {
-            std::cout << "Configuring RX Channel " << channel << std::endl;
+    foreach(channel; rx_channel_nums){
+        if (rx_channel_nums.length > 1) {
+            writeln("Configuring RX Channel ", channel);
         }
 
         //set the receive center frequency
-        if (not vm.count("rx-freq")){
-            std::cerr << "Please specify the center frequency with --rx-freq" << std::endl;
-            return ~0;
+        if (rx_freq.isNaN){
+            stderr.writeln("Please specify the center frequency with --rx-freq");
+            return;
         }
-        std::cout << boost::format("Setting RX Freq: %f MHz...") % (rx_freq/1e6) << std::endl;
-        uhd::tune_request_t rx_tune_request(rx_freq);
-        if(vm.count("rx-int-n")) rx_tune_request.args = uhd::device_addr_t("mode_n=integer");
-        rx_usrp->set_rx_freq(rx_tune_request, channel);
-        std::cout << boost::format("Actual RX Freq: %f MHz...") % (rx_usrp->get_rx_freq(channel)/1e6) << std::endl << std::endl;
+        writeln("Setting RX Freq: %f MHz...", rx_freq/1e6);
+        TuneRequest rx_tune_request = TuneRequest(rx_freq);
+        if(rx_int_n) rx_tune_request.args = "mode_n=integer";
+        rx_usrp.tuneRxFreq(rx_tune_request, channel);
+        writefln("Actual RX Freq: %f MHz...", rx_usrp.getRxFreq(channel)/1e6);
 
         //set the receive rf gain
-        if (vm.count("rx-gain")){
-            std::cout << boost::format("Setting RX Gain: %f dB...") % rx_gain << std::endl;
-            rx_usrp->set_rx_gain(rx_gain, channel);
-            std::cout << boost::format("Actual RX Gain: %f dB...") % rx_usrp->get_rx_gain(channel) << std::endl << std::endl;
+        if (! rx_gain.isNaN){
+            writefln("Setting RX Gain: %f dB...", rx_gain);
+            rx_usrp.setRxGain(rx_gain, channel);
+            writefln("Actual RX Gain: %f dB...", rx_usrp.getRxGain(channel));
         }
 
         //set the receive analog frontend filter bandwidth
-        if (vm.count("rx-bw")){
-            std::cout << boost::format("Setting RX Bandwidth: %f MHz...") % (rx_bw/1e6) << std::endl;
-            rx_usrp->set_rx_bandwidth(rx_bw, channel);
-            std::cout << boost::format("Actual RX Bandwidth: %f MHz...") % (rx_usrp->get_rx_bandwidth(channel)/1e6) << std::endl << std::endl;
+        if (! rx_bw.isNaN){
+            writefln("Setting RX Bandwidth: %f MHz...", rx_bw/1e6);
+            rx_usrp.setRxBandwidth(rx_bw, channel);
+            writefln("Actual RX Bandwidth: %f MHz...", rx_usrp.getRxBandwidth(channel)/1e6);
         }
     }
     //set the receive antenna
-    if (vm.count("ant")) rx_usrp->set_rx_antenna(rx_ant);
-
-    //for the const wave, set the wave freq for small samples per period
-    if (wave_freq == 0 and wave_type == "CONST"){
-        wave_freq = tx_usrp->get_tx_rate()/2;
-    }
-
-    //error when the waveform is not possible to generate
-    if (std::abs(wave_freq) > tx_usrp->get_tx_rate()/2){
-        throw std::runtime_error("wave freq out of Nyquist zone");
-    }
-    if (tx_usrp->get_tx_rate()/std::abs(wave_freq) > wave_table_len/2){
-        throw std::runtime_error("wave freq too small for table");
-    }
-
-    //pre-compute the waveform values
-    const wave_table_class wave_table(wave_type, ampl);
-    const size_t step = boost::math::iround(wave_freq/tx_usrp->get_tx_rate() * wave_table_len);
-    size_t index = 0;
+    if (! rx_ant.empty) rx_usrp.rxAntenna = rx_ant;
 
     //create a transmit streamer
     //linearly map channels (index0 = channel0, index1 = channel1, ...)
-    uhd::stream_args_t stream_args("fc32", otw);
-    stream_args.channels = tx_channel_nums;
-    uhd::tx_streamer::sptr tx_stream = tx_usrp->get_tx_stream(stream_args);
+    StreamArgs stream_args = StreamArgs("fc32", otw, "", tx_channel_nums);
+    auto tx_stream = tx_usrp.makeTxStreamer(stream_args);
 
     //allocate a buffer which we re-use for each channel
-    if (spb == 0) spb = tx_stream->get_max_num_samps()*10;
-    std::vector<std::complex<float> > buff(spb);
-    int num_channels = tx_channel_nums.size();
+    if (spb == 0) spb = tx_stream.maxNumSamps()*10;
+    immutable size_t num_channels = tx_channel_nums.length;
 
     //setup the metadata flags
-    uhd::tx_metadata_t md;
-    md.start_of_burst = true;
-    md.end_of_burst   = false;
-    md.has_time_spec  = true;
-    md.time_spec = uhd::time_spec_t(0.1); //give us 0.1 seconds to fill the tx buffers
+    TxMetaData md = TxMetaData(true, 0, 0.1, true, false);
 
     //Check Ref and LO Lock detect
-    std::vector<std::string> tx_sensor_names, rx_sensor_names;
-    tx_sensor_names = tx_usrp->get_tx_sensor_names(0);
-    if (std::find(tx_sensor_names.begin(), tx_sensor_names.end(), "lo_locked") != tx_sensor_names.end()) {
-        uhd::sensor_value_t lo_locked = tx_usrp->get_tx_sensor("lo_locked",0);
-        std::cout << boost::format("Checking TX: %s ...") % lo_locked.to_pp_string() << std::endl;
-        UHD_ASSERT_THROW(lo_locked.to_bool());
-    }
-    rx_sensor_names = rx_usrp->get_rx_sensor_names(0);
-    if (std::find(rx_sensor_names.begin(), rx_sensor_names.end(), "lo_locked") != rx_sensor_names.end()) {
-        uhd::sensor_value_t lo_locked = rx_usrp->get_rx_sensor("lo_locked",0);
-        std::cout << boost::format("Checking RX: %s ...") % lo_locked.to_pp_string() << std::endl;
-        UHD_ASSERT_THROW(lo_locked.to_bool());
-    }
-
-    tx_sensor_names = tx_usrp->get_mboard_sensor_names(0);
-    if ((ref == "mimo") and (std::find(tx_sensor_names.begin(), tx_sensor_names.end(), "mimo_locked") != tx_sensor_names.end())) {
-        uhd::sensor_value_t mimo_locked = tx_usrp->get_mboard_sensor("mimo_locked",0);
-        std::cout << boost::format("Checking TX: %s ...") % mimo_locked.to_pp_string() << std::endl;
-        UHD_ASSERT_THROW(mimo_locked.to_bool());
-    }
-    if ((ref == "external") and (std::find(tx_sensor_names.begin(), tx_sensor_names.end(), "ref_locked") != tx_sensor_names.end())) {
-        uhd::sensor_value_t ref_locked = tx_usrp->get_mboard_sensor("ref_locked",0);
-        std::cout << boost::format("Checking TX: %s ...") % ref_locked.to_pp_string() << std::endl;
-        UHD_ASSERT_THROW(ref_locked.to_bool());
+    string[] tx_sensor_names, rx_sensor_names;
+    // tx_sensor_names = tx_usrp->get_tx_sensor_names(0);
+    // foreach(sensor; tx_usrp.getTxSensorNames(0)) tx_sensor_names ~= sensor.dup;
+    foreach(i, ref usrp; AliasSeq!(tx_usrp, rx_usrp)){
+        foreach(sname; usrp.getTxSensorNames(0)){
+            if(sname == "lo_locked"){
+                SensorValue lo_locked = tx_usrp.getTxSensor(sname, 0);
+                static if(0) writefln("Checking %s: %s ...", i == 0 ? "TX" : "RX", lo_locked);
+                enforce(cast(bool)lo_locked);
+            }
+        }
     }
 
-    rx_sensor_names = rx_usrp->get_mboard_sensor_names(0);
-    if ((ref == "mimo") and (std::find(rx_sensor_names.begin(), rx_sensor_names.end(), "mimo_locked") != rx_sensor_names.end())) {
-        uhd::sensor_value_t mimo_locked = rx_usrp->get_mboard_sensor("mimo_locked",0);
-        std::cout << boost::format("Checking RX: %s ...") % mimo_locked.to_pp_string() << std::endl;
-        UHD_ASSERT_THROW(mimo_locked.to_bool());
-    }
-    if ((ref == "external") and (std::find(rx_sensor_names.begin(), rx_sensor_names.end(), "ref_locked") != rx_sensor_names.end())) {
-        uhd::sensor_value_t ref_locked = rx_usrp->get_mboard_sensor("ref_locked",0);
-        std::cout << boost::format("Checking RX: %s ...") % ref_locked.to_pp_string() << std::endl;
-        UHD_ASSERT_THROW(ref_locked.to_bool());
+    foreach(i, ref usrp; AliasSeq!(tx_usrp, rx_usrp)){
+        foreach(sname; usrp.getMboardSensorNames(0)){
+            if((ref_ == "mimo" && sname == "mimo_locked") || (ref_ == "external" && sname == "ref_locked")){
+                SensorValue locked = tx_usrp.getTxSensor(sname, 0);
+                static if(0) writefln("Checking %s: %s ...", i == 0 ? "TX" : "RX", locked);
+                enforce(cast(bool)locked);
+            }
+        }
     }
 
     if (total_num_samps == 0){
-        std::signal(SIGINT, &sig_int_handler);
-        std::cout << "Press Ctrl + C to stop streaming..." << std::endl;
+        import core.stdc.signal;
+        signal(SIGINT, &sig_int_handler);
+        writeln("Press Ctrl + C to stop streaming...");
     }
 
     //reset usrp time to prepare for transmit/receive
-    std::cout << boost::format("Setting device timestamp to 0...") << std::endl;
-    tx_usrp->set_time_now(uhd::time_spec_t(0.0));
+    writeln("Setting device timestamp to 0...");
+    tx_usrp.timeNow = 0.seconds;
 
     //start transmit worker thread
-    boost::thread_group transmit_thread;
-    transmit_thread.create_thread(boost::bind(&transmit_worker, buff, wave_table, tx_stream, md, step, index, num_channels));
+    // boost::thread_group transmit_thread;
+    // transmit_thread.create_thread(boost::bind(&transmit_worker, buff, wave_table, tx_stream, md, step, index, num_channels));
+    immutable(Complex!float[])[] waveTable;
+    foreach(i, filename; txfiles){
+        import std.file : read;
+        waveTable ~= cast(immutable(Complex!float[]))read(filename);
+    }
+
+    auto transmit_thread = new Thread(delegate(){
+        transmit_worker(spb, waveTable, tx_stream, md, num_channels);
+    });
+    transmit_thread.start();
 
     //recv to file
-    if (type == "double") recv_to_file<std::complex<double> >(rx_usrp, "fc64", otw, file, spb, total_num_samps, settling, rx_channel_nums);
-    else if (type == "float") recv_to_file<std::complex<float> >(rx_usrp, "fc32", otw, file, spb, total_num_samps, settling, rx_channel_nums);
-    else if (type == "short") recv_to_file<std::complex<short> >(rx_usrp, "sc16", otw, file, spb, total_num_samps, settling, rx_channel_nums);
+    if (type == "double") recv_to_file!(double[2])(rx_usrp, "fc64", otw, file, spb, total_num_samps, settling, rx_channel_nums);
+    else if (type == "float") recv_to_file!(float[2])(rx_usrp, "fc32", otw, file, spb, total_num_samps, settling, rx_channel_nums);
+    else if (type == "short") recv_to_file!(short[2])(rx_usrp, "sc16", otw, file, spb, total_num_samps, settling, rx_channel_nums);
     else {
         //clean up transmit worker
         stop_signal_called = true;
-        transmit_thread.join_all();
-        throw std::runtime_error("Unknown type " + type);
+        throw new Exception("Unknown type: " ~ type);
     }
 
     //clean up transmit worker
     stop_signal_called = true;
-    transmit_thread.join_all();
+    transmit_thread.join();
 
     //finished
-    std::cout << std::endl << "Done!" << std::endl << std::endl;
-    return EXIT_SUCCESS;
+    writeln("\nDone!\n");
 }

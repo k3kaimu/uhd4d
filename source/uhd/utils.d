@@ -49,19 +49,70 @@ void checkUHDError(uhd_error error)
 }
 
 
-Tuple!(time_t, double) splitToUnixTime(SysTime time)
+struct VUHDException
 {
-    auto unixTime = time.toUnixTime();
-    auto fracSecs = time.fracSecs.total!"nsecs" * 1.0  / 1.0E-9;
+    this(uhd_error error) nothrow @nogc
+    {
+        if(error == uhd_error.NONE){
+            _init = false;
+            _error = error;
+        }else{
+            _init = true;
+            _error = error;
+        }
+    }
 
-    return typeof(return)(unixTime, fracSecs);
+
+    bool opCast(T : bool)() const nothrow @nogc
+    {
+        return _init;
+    }
+
+
+    UHDException makeException() @property
+    {
+        if(!_init) return null;
+
+        import std.conv : to;
+        char[] buf = new char[1024];
+        uhd_get_last_error(buf.ptr, buf.length-1);
+        return new UHDException(buf.ptr.to!string);
+    }
+
+
+    void print() nothrow @nogc
+    {
+        import core.stdc.stdio : puts;
+
+        char[2048] buf;
+        uhd_get_last_error(buf.ptr, buf.length - 1);
+        puts(buf.ptr);
+    }
+
+
+    alias makeException this;
+
+
+  private:
+    bool _init;
+    uhd_error _error;
 }
 
 
-SysTime toSysTime(time_t fullSecs, double fracSecs)
+Tuple!(time_t, real) splitToFullAndFracSecs(Duration time)
 {
-    SysTime time = SysTime.fromUnixTime(fullSecs);
-    time += (cast(long)(fracSecs * 1E9)).nsecs;
+    auto s_ns = time.split!("seconds", "nsecs");
+
+    return typeof(return)(s_ns.seconds, s_ns.nsecs / 1.0E-9L);
+}
+
+
+Duration toDuration(time_t fullSecs, real fracSecs)
+{
+    import std.math : floor;
+
+    Duration time = fullSecs.seconds;
+    time += (cast(long)floor(fracSecs * 1E9L)).nsecs;
 
     return time;
 }

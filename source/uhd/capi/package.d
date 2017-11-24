@@ -12,7 +12,7 @@ public import uhd.capi.types.usrp_info;
 
 public import uhd.capi.usrp.dboard_eeprom;
 public import uhd.capi.usrp.mboard_eeprom;
-//public import uhd.capi.subdev_spec;
+public import uhd.capi.usrp.subdev_spec;
 public import uhd.capi.usrp.usrp;
 
 public import uhd.capi.usrp_clock.usrp_clock;

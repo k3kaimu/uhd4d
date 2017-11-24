@@ -6,6 +6,9 @@ import uhd.capi.error;
 
 
 extern(C):
+nothrow:
+@nogc:
+
 
 struct uhd_mboard_eeprom_t;
 

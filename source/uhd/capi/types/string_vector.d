@@ -4,10 +4,13 @@ module uhd.capi.types.string_vector;
 import uhd.capi.config;
 import uhd.capi.error;
 
-struct uhd_string_vector_t;
-
 
 extern(C):
+nothrow:
+@nogc:
+
+
+struct uhd_string_vector_t;
 
 alias uhd_string_vector_handle = uhd_string_vector_t*;
 

@@ -17,6 +17,8 @@ import uhd.capi.usrp.subdev_spec;
 
 
 extern(C):
+nothrow:
+@nogc:
 
 struct uhd_usrp_register_info_t
 {

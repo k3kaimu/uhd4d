@@ -4,6 +4,9 @@ import uhd.capi.config;
 
 
 extern(C):
+nothrow:
+@nogc:
+
 
 struct uhd_tune_result_t
 {

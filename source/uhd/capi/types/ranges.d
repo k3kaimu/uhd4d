@@ -4,6 +4,9 @@ import uhd.capi.config;
 import uhd.capi.error;
 
 extern(C):
+nothrow:
+@nogc:
+
 
 struct uhd_range_t
 {

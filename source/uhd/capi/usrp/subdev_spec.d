@@ -6,6 +6,9 @@ import uhd.capi.error;
 
 
 extern(C):
+nothrow:
+@nogc:
+
 
 struct uhd_subdev_spec_pair_t
 {
