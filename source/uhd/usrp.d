@@ -363,7 +363,7 @@ struct RxStreamer
     if((!isArray!T || isStaticArray!T) && isAssignable!T)
     in{
         assert(buffers.length != 0);
-        immutable len = buffers.length;
+        immutable len = buffers[0].length;
         foreach(buf; buffers) assert(buf.length == len);
     }
     body{
@@ -387,7 +387,7 @@ struct RxStreamer
     if((!isArray!T || isStaticArray!T) && isAssignable!T)
     in{
         assert(buffers.length != 0);
-        immutable len = buffers.length;
+        immutable len = buffers[0].length;
         foreach(buf; buffers) assert(buf.length == len);
     }
     body{
@@ -456,7 +456,12 @@ struct TxStreamer
 
     size_t send(T)(in T[][] buffers, ref TxMetaData metadata, double timeout = 0.1)
     if((!isArray!T || isStaticArray!T) && isAssignable!T)
-    {
+    in{
+        assert(buffers.length != 0);
+        immutable len = buffers[0].length;
+        foreach(buf; buffers) assert(buf.length == len);
+    }
+    body{
         const(void)*[64] bufs;
         foreach(i, b; buffers) bufs[i] = b.ptr;
         size_t dst;
@@ -475,10 +480,15 @@ struct TxStreamer
 
     VUHDException send(T)(in T[][] buffers, ref TxMetaData metadata, double timeout, ref size_t size) nothrow @nogc
     if((!isArray!T || isStaticArray!T) && isAssignable!T)
-    {
+    in{
+        assert(buffers.length != 0);
+        immutable len = buffers[0].length;
+        foreach(buf; buffers) assert(buf.length == len);
+    }
+    body{
         const(void)*[64] bufs;
         foreach(i, b; buffers) bufs[i] = b.ptr;
-        return VUHDException(uhd_tx_streamer_send(_handle, bufs.ptr, buffers.length, &(metadata._handle), timeout, &size));
+        return VUHDException(uhd_tx_streamer_send(_handle, bufs.ptr, buffers[0].length, &(metadata._handle), timeout, &size));
     }
 
 
@@ -737,8 +747,14 @@ struct USRP
 
     void clockSource(string source) @property
     {
+        this.setClockSource(source, ALL_MBOARDS);
+    }
+
+
+    void setClockSource(string source, size_t mboard = ALL_MBOARDS) @property
+    {
         import std.string : toStringz;
-        uhd_usrp_set_clock_source(_handle._handle, source.toStringz(), 0).checkUHDError();
+        uhd_usrp_set_clock_source(_handle._handle, source.toStringz(), mboard).checkUHDError();
     }
 
 
@@ -754,9 +770,15 @@ struct USRP
 
     void timeSource(string source) @property
     {
+        this.setTimeSource(source, ALL_MBOARDS);
+    }
+
+
+    void setTimeSource(string source, size_t mboard = ALL_MBOARDS) @property
+    {
         import std.string : toStringz;
 
-        uhd_usrp_set_time_source(_handle._handle, source.toStringz(), 0).checkUHDError();
+        uhd_usrp_set_time_source(_handle._handle, source.toStringz(), mboard).checkUHDError();
     }
 
 
@@ -772,14 +794,21 @@ struct USRP
 
     void timeNow(Duration timeSpec) @property
     {
-        this.setTimeNow(timeSpec, 0);
+        this.setTimeNow(timeSpec, ALL_MBOARDS);
     }
 
 
-    void setTimeNow(Duration timeSpec, size_t mboard = 0)
+    void setTimeNow(Duration timeSpec, size_t mboard = ALL_MBOARDS)
     {
         auto uhdtime = timeSpec.splitToFullAndFracSecs();
         uhd_usrp_set_time_now(_handle._handle, uhdtime[0], uhdtime[1], mboard).checkUHDError();
+    }
+
+
+    void setTimeUnknownPPS(Duration timeSpec)
+    {
+        auto uhdtime = timeSpec.splitToFullAndFracSecs();
+        uhd_usrp_set_time_unknown_pps(_handle._handle, uhdtime[0], uhdtime[1]).checkUHDError();
     }
 
 
@@ -908,6 +937,7 @@ struct USRP
     StringList getTxSensorNames(size_t channel)
     {
         uhd_string_vector_handle slist;
+        uhd_string_vector_make(&slist).checkUHDError();
         uhd_usrp_get_tx_sensor_names(_handle._handle, channel, &slist).checkUHDError();
         return StringList(slist);
     }
@@ -916,6 +946,7 @@ struct USRP
     StringList getRxSensorNames(size_t channel)
     {
         uhd_string_vector_handle slist;
+        uhd_string_vector_make(&slist).checkUHDError();
         uhd_usrp_get_rx_sensor_names(_handle._handle, channel, &slist).checkUHDError();
         return StringList(slist);
     }
@@ -924,6 +955,7 @@ struct USRP
     StringList getMboardSensorNames(size_t mboard)
     {
         uhd_string_vector_handle slist;
+        uhd_string_vector_make(&slist).checkUHDError();
         uhd_usrp_get_mboard_sensor_names(_handle._handle, mboard, &slist).checkUHDError();
         return StringList(slist);
     }
@@ -934,6 +966,7 @@ struct USRP
         import std.string : toStringz;
 
         uhd_sensor_value_handle handle;
+        uhd_sensor_value_make_from_string(&handle, "", "", "");
         uhd_usrp_get_tx_sensor(_handle._handle, name.toStringz, channel, &handle);
         return SensorValue(handle);
     }
@@ -944,6 +977,7 @@ struct USRP
         import std.string : toStringz;
 
         uhd_sensor_value_handle handle;
+        uhd_sensor_value_make_from_string(&handle, "", "", "");
         uhd_usrp_get_rx_sensor(_handle._handle, name.toStringz, channel, &handle);
         return SensorValue(handle);
     }

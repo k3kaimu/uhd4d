@@ -99,7 +99,7 @@ uhd_error uhd_usrp_get_mboard_name(uhd_usrp_handle h, size_t mboard, char* mboar
 uhd_error uhd_usrp_get_time_last_pps(uhd_usrp_handle h, size_t mboard, time_t* full_secs_out, double* frac_secs_out);
 uhd_error uhd_usrp_set_time_now(uhd_usrp_handle h, time_t full_secs, double frac_secs, size_t mboard);
 uhd_error uhd_usrp_set_time_next_pps(uhd_usrp_handle h, time_t full_secs, double frac_secs, size_t mboard);
-uhd_error uhd_usrp_se_time_unknown_pps(uhd_usrp_handle h, time_t full_secs, double frac_secs);
+uhd_error uhd_usrp_set_time_unknown_pps(uhd_usrp_handle h, time_t full_secs, double frac_secs);
 uhd_error uhd_usrp_get_time_synchronized(uhd_usrp_handle h, bool* result_out);
 uhd_error uhd_usrp_set_command_time(uhd_usrp_handle h, time_t full_secs, double frac_secs, size_t mboard);
 uhd_error uhd_usrp_clear_command_time(uhd_usrp_handle h, size_t mboard);

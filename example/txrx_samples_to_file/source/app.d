@@ -73,29 +73,19 @@ void transmit_worker(
     size_t[] indexList = new size_t[num_channels];
     TxMetaData afterFirstMD = TxMetaData(false, 0, 0, false, false);
     TxMetaData endMD = TxMetaData(false, 0, 0, false, true);
-    TxMetaData* mdp = &metadata;
     VUHDException error;
+
+    tx_streamer.send(cast(Complex!float[][])[null,null], metadata, 0.1);
 
     //send data until the signal handler gets called
     () @nogc {
         while(!stop_signal_called){
-            //fill the buffer with the waveform
-            foreach(ch; 0 .. num_channels){
-                foreach(n; 0 .. samplesPerBuffer){
-                    indexList[ch] += 1;
-                    buffs[ch][n] = wave_table[ch][indexList[ch] % $];
-                }
-            }
-
             //send the entire contents of the buffer
             size_t txsize;
-            if(auto err =tx_streamer.send(buffs, *mdp, 0.1, txsize)){
+            if(auto err =tx_streamer.send(wave_table, afterFirstMD, 0.1, txsize)){
                 error = err;
                 return;
             }
-
-            if(mdp !is &afterFirstMD)
-                mdp = &afterFirstMD;
         }
     }();
 
@@ -121,19 +111,18 @@ void recv_to_file(E)(
     float settling_time,
     immutable(size_t)[] rx_channel_nums
 ){
+    writeln(E.stringof);
     int num_total_samps = 0;
     //create a receive streamer
+    writeln("CHHANELNUMS: ", rx_channel_nums);
+    writeln("CPU_FORMAT: ", cpu_format);
+    writeln("WIRE_FORMAT: ", wire_format);
     StreamArgs stream_args = StreamArgs(cpu_format, wire_format, "", rx_channel_nums);
     RxStreamer rx_stream = usrp.makeRxStreamer(stream_args);
 
     // Prepare buffers for received samples and metadata
-    RxMetaData md;
+    RxMetaData md = makeRxMetaData();
     E[][] buffs = new E[][](rx_channel_nums.length, samps_per_buff);
-
-    //create a vector of pointers to point to each of the channel buffers
-    E*[] buff_ptrs;
-    for (size_t i = 0; i < buffs.length; i++)
-        buff_ptrs ~= buffs[i].ptr;
 
     // Create one ofstream object per channel
     import core.stdc.stdio : FILE, fwrite, fopen, fclose;
@@ -160,14 +149,13 @@ void recv_to_file(E)(
         StreamCommand.startContinuous :
         StreamCommand.numSampsAndDone(num_requested_samples);
 
-    stream_cmd.streamNow = false;
+    stream_cmd.streamNow = true;
     stream_cmd.timeSpec = (cast(long)floor(settling_time*1E6)).usecs;
     rx_stream.issue(stream_cmd);
 
     VUHDException error;
-    () @nogc {
+    () /*@nogc*/ {
         while(! stop_signal_called && (num_requested_samples > num_total_samps || num_requested_samples == 0)){
-            // size_t num_rx_samps = rx_stream.recv(buff_ptrs, samps_per_buff, md, timeout);
             size_t num_rx_samps;
             if(auto err = rx_stream.recv(buffs, md, timeout, num_rx_samps)){
                 error = err;
@@ -258,7 +246,7 @@ void main(string[] args){
         "tx-gain",  "gain for the transmit RF chain",               &tx_gain,
         "rx-gain",  "gain for the receive RF chain",                &rx_gain,
         "tx-ant",   "transmit antenna selection",                   &tx_ant,
-        "rx-and",   "receive antenna selection",                    &rx_ant,
+        "rx-ant",   "receive antenna selection",                    &rx_ant,
         "tx-subdev",    "transmit subdevice specification",         &tx_subdev,
         "rx-subdev",    "receive subdevice specification",          &rx_subdev,
         "tx-bw",    "analog transmit filter bandwidth in Hz",       &tx_bw,
@@ -285,16 +273,6 @@ void main(string[] args){
     USRP rx_usrp = USRP(rx_args);
 
     //detect which channels to use
-    // std::vector<std::string> tx_channel_strings;
-    // std::vector<size_t> tx_channel_nums;
-    // boost::split(tx_channel_strings, tx_channels, boost::is_any_of("\"',"));
-    // for(size_t ch = 0; ch < tx_channel_strings.size(); ch++){
-    //     size_t chan = boost::lexical_cast<int>(tx_channel_strings[ch]);
-    //     if(chan >= tx_usrp->get_tx_num_channels()){
-    //         throw std::runtime_error("Invalid TX channel(s) specified.");
-    //     }
-    //     else tx_channel_nums.push_back(boost::lexical_cast<int>(tx_channel_strings[ch]));
-    // }
     immutable(size_t)[] tx_channel_nums = tx_channels.splitter(',').map!(to!size_t).array();
     enforce(tx_channel_nums.length == txfiles.length, "The number of channels is not equal to the number of txfiles.");
     foreach(e; tx_channel_nums) enforce(e < tx_usrp.txNumChannels, "Invalid TX channel(s) specified.");
@@ -307,8 +285,6 @@ void main(string[] args){
     rx_usrp.clockSource = ref_;
 
     //always select the subdevice first, the channel mapping affects the other settings
-    // if (vm.count("tx-subdev")) tx_usrp->set_tx_subdev_spec(tx_subdev);
-    // if (vm.count("rx-subdev")) rx_usrp->set_rx_subdev_spec(rx_subdev);
     if(! tx_subdev.empty) tx_usrp.txSubdevSpec = tx_subdev;
     if(! rx_subdev.empty) rx_usrp.rxSubdevSpec = rx_subdev;
 
@@ -381,7 +357,7 @@ void main(string[] args){
             stderr.writeln("Please specify the center frequency with --rx-freq");
             return;
         }
-        writeln("Setting RX Freq: %f MHz...", rx_freq/1e6);
+        writefln("Setting RX Freq: %f MHz...", rx_freq/1e6);
         TuneRequest rx_tune_request = TuneRequest(rx_freq);
         if(rx_int_n) rx_tune_request.args = "mode_n=integer";
         rx_usrp.tuneRxFreq(rx_tune_request, channel);
@@ -402,24 +378,27 @@ void main(string[] args){
         }
     }
     //set the receive antenna
+    writeln("DONE");
     if (! rx_ant.empty) rx_usrp.rxAntenna = rx_ant;
 
     //create a transmit streamer
     //linearly map channels (index0 = channel0, index1 = channel1, ...)
+    writeln("Create Streaming Object");
     StreamArgs stream_args = StreamArgs("fc32", otw, "", tx_channel_nums);
     auto tx_stream = tx_usrp.makeTxStreamer(stream_args);
 
+    writeln("Set spb");
     //allocate a buffer which we re-use for each channel
     if (spb == 0) spb = tx_stream.maxNumSamps()*10;
     immutable size_t num_channels = tx_channel_nums.length;
 
     //setup the metadata flags
+    writeln("Make TxMetaData");
     TxMetaData md = TxMetaData(true, 0, 0.1, true, false);
 
+    writeln("Check Ref and LO Lock detect");
     //Check Ref and LO Lock detect
     string[] tx_sensor_names, rx_sensor_names;
-    // tx_sensor_names = tx_usrp->get_tx_sensor_names(0);
-    // foreach(sensor; tx_usrp.getTxSensorNames(0)) tx_sensor_names ~= sensor.dup;
     foreach(i, ref usrp; AliasSeq!(tx_usrp, rx_usrp)){
         foreach(sname; usrp.getTxSensorNames(0)){
             if(sname == "lo_locked"){
@@ -446,19 +425,23 @@ void main(string[] args){
         writeln("Press Ctrl + C to stop streaming...");
     }
 
+    immutable(Complex!float[])[] waveTable;
+    foreach(i, filename; txfiles){
+        import std.file : read;
+        auto signal = cast(Complex!float[])read(filename);
+        foreach(ref e; signal) e *= ampl;
+        waveTable ~= cast(immutable)signal;
+    }
+
+    enforce(txfiles.length == tx_channel_nums.length);
+
     //reset usrp time to prepare for transmit/receive
     writeln("Setting device timestamp to 0...");
     tx_usrp.timeNow = 0.seconds;
 
-    //start transmit worker thread
-    // boost::thread_group transmit_thread;
-    // transmit_thread.create_thread(boost::bind(&transmit_worker, buff, wave_table, tx_stream, md, step, index, num_channels));
-    immutable(Complex!float[])[] waveTable;
-    foreach(i, filename; txfiles){
-        import std.file : read;
-        waveTable ~= cast(immutable(Complex!float[]))read(filename);
-    }
+    Thread.sleep(1.seconds);
 
+    //start transmit worker thread
     auto transmit_thread = new Thread(delegate(){
         transmit_worker(spb, waveTable, tx_stream, md, num_channels);
     });
