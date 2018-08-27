@@ -470,6 +470,14 @@ struct TxStreamer
     }
 
 
+    void send(typeof(null), ref TxMetaData metadata, double timeout = 0.1)
+    {
+        void* p = null;
+        size_t dst;
+        uhd_tx_streamer_send(_handle, &p, 0, &(metadata._handle), timeout, &dst).checkUHDError();
+    }
+
+
     VUHDException send(T)(in T[] buffer, ref TxMetaData metadata, double timeout, ref size_t size) nothrow @nogc
     if((!isArray!T || isStaticArray!T) && isAssignable!T)
     {
